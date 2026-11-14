@@ -7,7 +7,6 @@ find returns the instances the call should catch; each is graded on its own
 (tools.Env.find).  An instance is a box, or None for one no proposed box frames.
 """
 from __future__ import annotations
-import json
 import re
 from typing import List, Optional, Set
 
@@ -82,6 +81,12 @@ def _inside(obj: Box, region: Box) -> bool:
 GRADER = "gpt-6.1-terra"
 GRADER_EFFORT = "medium"      # ponytail: one fixed effort; tune if the grader audit says so
 YN = " Answer with exactly one word: yes or no."
+FRAME = ('Does the red box frame one {name}? Answer yes if it mainly frames a single "{name}" (hidden '
+         'or cut-off parts are fine), no if it frames something else, only a small part of one, '
+         'or several together.' + YN)
+NAMES = ("What is the main object in this image? List the names a person might use for it, from most "
+         'specific to most general (e.g. "baseball player, player, person"), comma-separated, at most '
+         "six, nothing else.")
 COLORS_DRAW = ["red", "blue", "lime", "magenta", "orange", "cyan", "yellow", "white"]
 
 
@@ -108,7 +113,7 @@ def draw_boxes(image, region: Box, boxes, min_side: int = 512):
 
 class TerraLabeler:
     """A strong model grades each call by answering it itself, from the same
-    crop the tool saw (find: the region with every proposed box numbered)."""
+    crop the tool saw, without seeing the tool's scores."""
     def __init__(self, image_id: str, image, backends, model: str = GRADER):
         self.image_id, self.image, self.b, self.model = image_id, image, backends, model
 
@@ -117,17 +122,29 @@ class TerraLabeler:
                            [self.image_id, [round(v) for v in box]], reasoning_effort=GRADER_EFFORT)
 
     def find(self, name: str, region: Box, cands=None) -> Optional[List[Box]]:
-        boxes = [b for b, _ in (cands or [])]
-        img = draw_boxes(self.image, region, boxes)
-        drawn = f"{len(boxes)} numbered boxes are drawn on this image." if boxes else "No boxes are drawn."
-        text = (f"{drawn} Count every {name} in the image.\n"
-                f'Reply with JSON only: {{"framed": [...], "unframed": N}}. "framed" lists the numbers '
-                f"of boxes that each frame one whole {name} (if several boxes frame the same {name}, "
-                f'list only the best one). "unframed" is how many {name}s no listed box frames.')
-        reply = self.b.chat(self.model, [(img, (0, 0, img.width, img.height))], text,
-                            [self.image_id, [round(v) for v in region], [[round(v) for v in b] for b in boxes]],
-                            reasoning_effort=GRADER_EFFORT)
-        return parse_find(reply, boxes)
+        """Count the objects in the region (no boxes drawn), then check proposed
+        boxes one at a time, best score first, each drawn alone; stop once as many
+        are confirmed as counted.  Objects no box frames come back as None.  A
+        box framing an already confirmed object is skipped (same object)."""
+        n = _count(self._ask(self.image, region, f'How many separate objects matching "{name}" are '
+                                                 f"visible in this image? Answer with a number only."))
+        if n is None:
+            return None
+        found = []
+        for b, _ in sorted(cands or [], key=lambda c: -c[1]):
+            if len(found) >= n:
+                break
+            if any(same_object(f, b) for f in found):
+                continue
+            img = draw_boxes(self.image, region, [b])
+            yn = _yn(self.b.chat(self.model, [(img, (0, 0, img.width, img.height))], FRAME.format(name=name),
+                                 [self.image_id, [round(v) for v in region], [round(v) for v in b]],
+                                 reasoning_effort=GRADER_EFFORT))
+            if yn is None:
+                return None
+            if yn == YES:
+                found.append(tuple(b))
+        return found + [None] * (n - len(found))
 
     def exists(self, name: str, region: Box) -> Optional[str]:
         return _yn(self._ask(self.image, region, f"Is there a {name} in this image?" + YN))
@@ -138,9 +155,9 @@ class TerraLabeler:
             return None
         obj = name if name and name != "image" else "main object"
         if cat == "name":
-            a = norm(self._ask(self.image, box, "What is the main object in this image? "
-                                                "Answer with its name, in one or two words."))
-            return {a} if a else None
+            # every name a person might use: "person" and "baseball player" are both right
+            names = {norm(x) for x in self._ask(self.image, box, NAMES).split(",")} - {""}
+            return names or None
         a = _attr(self._ask(self.image, box, f"What is the {attribute} of the {obj} in this image? "
                                              f"Answer with exactly one word from: {', '.join(sorted(cat))}."))
         return {a} if a in cat else None
@@ -162,15 +179,9 @@ class TerraLabeler:
                                reasoning_effort=GRADER_EFFORT))
 
 
-def parse_find(reply: str, boxes) -> Optional[List[Optional[Box]]]:
-    m = re.search(r"\{.*\}", reply or "", re.DOTALL)
-    try:
-        d = json.loads(m.group(0)) if m else None
-        framed = sorted({int(i) for i in d["framed"] if 1 <= int(i) <= len(boxes)})
-        unframed = min(max(int(d["unframed"]), 0), 20)
-    except (TypeError, KeyError, ValueError, json.JSONDecodeError):
-        return None
-    return [tuple(boxes[i - 1]) for i in framed] + [None] * unframed
+def _count(text: str) -> Optional[int]:
+    m = re.search(r"\d+", text or "")
+    return min(int(m.group()), 20) if m else None
 
 
 class SceneGraphLabeler:
@@ -309,15 +320,25 @@ if __name__ == "__main__":
     assert R.exists("plate", whole) == YES                                   # exists ignores relevance
     # the strong-model grader, with canned replies
     class FakeBackends:
+        calls = []
         def chat(self, model, crops, text, key, **kw):
-            assert "Count" not in text or crops[0][0].size[0] >= 512   # drawn find crop is upscaled
-            return {"Count": '{"framed": [2, 9], "unframed": 1}', "color": "Wooden", "Box 1": "no"}.get(
-                next(k for k in ("Count", "color", "Box 1", "") if k in text), "Yes.")
+            self.calls.append(key)
+            if "How many" in text:
+                return "2"
+            if "red box" in text:
+                assert crops[0][0].size[0] >= 512                    # the drawn crop is upscaled
+                return "Yes." if key[-1] == [20, 20, 60, 60] else "no"
+            return {"color": "Wooden", "names": "Baseball player, player, Person", "Box 1": "no"}.get(
+                next(k for k in ("color", "names", "Box 1", "") if k in text), "Yes.")
     from PIL import Image
-    T = TerraLabeler("img", Image.new("RGB", (200, 200)), FakeBackends())
-    cands = [((0, 0, 10, 10), 0.9), ((20, 20, 60, 60), 0.5)]
-    assert T.find("cup", whole, cands) == [(20, 20, 60, 60), None]   # box 2 framed, 9 ignored, 1 missed
+    fb = FakeBackends()
+    T = TerraLabeler("img", Image.new("RGB", (200, 200)), fb)
+    cands = [((0, 0, 10, 10), 0.9), ((22, 22, 60, 60), 0.4), ((20, 20, 60, 60), 0.5)]
+    # 2 counted; box 1 no, box (20,20,60,60) yes, (22,22,..) the same cup -> not asked; 1 missed
+    assert T.find("cup", whole, cands) == [(20, 20, 60, 60), None]
+    assert [k[-1] for k in fb.calls[1:]] == [[0, 0, 10, 10], [20, 20, 60, 60]]
     assert T.query((20, 20, 60, 60), "color") is None                  # "wood" is not a color
+    assert T.query((20, 20, 60, 60), "name") == {"baseball player", "player", "person"}
     assert T.exists("cup", whole) == YES and T.relate(whole, whole, "on") == NO
-    assert parse_find("no json here", []) is None and parse_find('{"framed": [], "unframed": 0}', []) == []
+    assert _count("about 3 cups") == 3 and _count("none") is None
     print("labels ok")

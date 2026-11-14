@@ -10,7 +10,7 @@ S(y_t) and the call's groups are still logged so they can become calibration dat
 from __future__ import annotations
 from typing import Dict, List, Optional
 
-from answer_dsl import NO, WILD, YES, Box, DslError, Program, covers, fmt, match, norm
+from answer_dsl import NO, WILD, YES, Box, DslError, Program, fmt, match, norm
 from conformal import CAL_KEY
 from labels import COLORS, MATERIALS, category, same_object
 from selector import Selection, default_selectors, qtype
@@ -151,8 +151,10 @@ class Env:
         truths = self.labeler.query(box, attribute, self._name(region))
         covered = true_score = None
         if truths is not None:
-            covered = any(covers(frozenset(values), t) for t in truths)
-            true_score = min(1 - max((p for a, p in answers if match(t, a)), default=0.0)
+            # names match either way round: "laptop" names a "laptop computer"
+            hit = (lambda t, a: match(t, a) or match(a, t)) if cat == "name" else match
+            covered = WILD in values or any(hit(t, v) for t in truths for v in values)
+            true_score = min(1 - max((p for a, p in answers if hit(t, a)), default=0.0)
                              for t in truths)
         return self._finish("query", f'query({region}, "{attribute}")', values, deps,
                             sorted(truths) if truths else None, covered, true_score,

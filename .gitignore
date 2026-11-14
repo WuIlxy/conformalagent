@@ -9,3 +9,4 @@ conformalagentloop/data/cache/
 conformalagentloop/src/oracle_audit.py
 conformalagentloop/runs/
 .venv/
+conformalagentloop/NOTES.md
