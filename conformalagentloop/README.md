@@ -6,12 +6,6 @@ Conformal Inference** (ACI; Gibbs & Candès, *Adaptive Conformal Inference Under
 Distribution Shift*, NeurIPS 2021), and whose final answer is a **one-line DSL
 spec over the observed sets**, so answer coverage follows from tool coverage.
 
-> Status: **design spec**. This README is the contract; code lands after it is
-> reviewed. v1 (mocked skeleton) is at commit `779cd7f`.
-> Setting: GQA val, ground-truth labels for intermediate tool calls come from
-> the GQA scene graphs. Later datasets: a strong model does that labelling
-> (§6 is the single swap point).
-
 ---
 
 ## 1. One question, end to end
@@ -22,12 +16,12 @@ question + image
    ▼
 policy LLM (function calling) ── tool call ──► backend scores ──► set Ĉ_t = {y : S(y) ≤ Q̂_k(1-α_t)}
    ▲                                                                 │
-   │   observation o_t: the set, its id, α_t                        │ scene-graph label y_t
+   │   observation o_t: the set, its id, α_t                        │ grader label y_t
    └─────────────────────────────────────────────────────────────────┤ err_t = 1[y_t ∉ Ĉ_t]
                                                                      ▼
                                                   α_{t+1} = α_t + γ(α* − err_t)   (ACI, per question)
    ...
-policy ── answer("yesno(same(o2, o4))") ──► deterministic eval over o2, o4 ──► answer set + α budget
+policy ── answer("same(o2, o4)") ──► deterministic eval over o2, o4 ──► answer set + running bound
 ```
 
 Every tool call is one ACI step. Feedback is **immediate**: the label for call
@@ -50,14 +44,17 @@ From the paper (§2, §4), for a stream of calls t = 1..T:
 The paper lets `S_t` and `Q̂_t` change with t. We use that: **one shared level
 α_t per question, one score function + calibration set per tool k**. Call t
 uses tool k_t and threshold `Q̂_{k_t}(1 − α_t)`. So a miss on `find` widens the
-next `query`. A tool is called only once or twice per question, so separate
+next `query`. The calibration families are `find`, `query`, and `yesno`: `verify`,
+`exists` and `relate` share one VLM yes/no prompt and pool their scores, since
+each alone is called too rarely to calibrate. A tool is called only once or twice per question, so separate
 per-tool levels would barely move.
 
-**Per question, reset.** Questions are treated as iid, so each (question, image)
-runs its own ACI from α_1. With T ≈ 3–6 calls, Prop. 4.1 is vacuous inside one
-trace. What it provides there is the behaviour: the trace gets more
-conservative after an observed error on *this* image. The guarantee comes
-from the outer layer (§4), which is valid *because* questions are iid.
+**Per question, reset to α_1 = α\*.** This follows the paper: start at the
+target level. Questions are treated as iid, so each (question, image) runs
+its own ACI from α_1 = α\*. Each tool's *baseline* is its calibrated threshold
+map `Q̂_k` (§4), not a different starting α. With T ≈ 3–6 calls, Prop. 4.1 is
+vacuous inside one trace. What ACI provides there is the behaviour: the trace
+gets more conservative after an observed error on *this* image.
 
 Calls whose label can't be resolved (§6) are **unlabeled**: there's no update
 and α_t carries forward. They are logged and counted.
@@ -75,64 +72,161 @@ from it.
 | tool | set over | score `S(y)` | backend (copied from) |
 |---|---|---|---|
 | `find(name, region="image")` | boxes → new region ids `r_i` | `1 − owl_score(box)` | OWLv2 (`imgpatch_local`, `imgpatch_conformal.find`) |
-| `query(region, attribute)` | values, `attribute ∈ {color, material, name, …}` | `1 − p_vlm(y)` (0 if not listed → S = 1) | gpt-4o-mini JSON answers+scores (`imgpatch_conformal._do_model_call_real`) |
-| `verify(region, property)` | `{yes, no}` | `S(yes) = 1 − p_yes`, `S(no) = p_yes` | same prompt (`verify_property`) |
-| `exists(name, region="image")` | `{yes, no}` | as `verify` | same prompt |
-| `relate(region_a, region_b, relation)` | `{yes, no}` | as `verify`, on the union-box crop | same prompt |
+| `query(region, attribute)` | values, `attribute ∈ {color, material, name, …}` | `1 − p(y)`. Closed categories (color, material, size, …): gpt-6-luna's Decisions API `choice` question gives `p` for every label word (`Backends.choose`; reported to 0.01, so words under 0.005 tie at S = 1). Open ones (name, free questions): JSON answers + self-reported scores, 0 if not listed → S = 1 | closed: Decisions API (gpt-6-luna); open: `--vlm_model` (gpt-6-luna) |
+| `verify(region, property)` | `{yes, no}` | `S(yes) = 1 − p_yes`, `S(no) = p_yes`; `p_yes` from a Decisions API `predicate` question (`Backends.predicate`) | Decisions API (gpt-6-luna) |
+| `exists(name, region="image")` | `{yes, no}` | as `verify` | same |
+| `relate(region_a, region_b, relation)` | `{yes, no}` | as `verify`, on the union-box crop | same |
 
-- `find`'s set covers iff **every** ground-truth instance is matched (IoU ≥ 0.5)
-  by a box in the set. Its true-label score is `max over instances of
-  (1 − best matching owl_score)` (1 if an instance was never detected). So
-  `Q̂(1−α)` is "the cutoff needed to catch all instances".
+- **`find` grades each instance on its own.** For every instance the grader
+  says the call should catch, the true-label score is `1 − best matching
+  owl_score` (1 if no proposed box finds it), and that instance is covered iff a
+  box in the set finds it. Each instance is one calibration row and one ACI
+  update; the call counts as covered (for the trace's closure) iff all its
+  instances are. Requiring *all* instances in one event pushed the 90% cutoff
+  to "keep every box" for both OWL and Grounding DINO (150 replayed calls:
+  OWL 0.89 / Grounding DINO 0.91 of calls had every instance among the
+  proposals). "Found" (`labels.same_object`): IoU ≥ 0.3, or the box holds ≥ 80%
+  of the object while being at most 4× its area.
+- **`find`'s full set.** When the threshold reaches 1, the set also gets the
+  searched region itself, shown as "anywhere in the searched region". OWL's
+  proposals alone aren't the full label space (they miss ~14% of instances),
+  and ACI needs the full set to cover. `side`/`above` treat that region as
+  "either side".
+- `relate` rejects left/right/above/below: those come from box geometry via
+  `side`/`above` in the answer spec, over all box pairs at once.
 - `exists` is its own yes/no tool rather than "is the find set non-empty".
   Conformal find sets are supersets, so non-empty proves nothing.
 - `⊤` (full set) appears when α_t ≤ 0: for `query` it means "any value".
 - VLM calls are disk-cached by `(image crop, prompt)`, like `imgpatch_conformal`.
 - GQA has no counting questions, so there's no `count`.
 
-## 4. Choosing α_1: outer layer over iid questions
+## 4. Per-tool baseline: calibrate, then test
 
-`α_1` is chosen on a calibration split **of this agent's own traces**. The
-agent's sets change which calls it makes next, so calibration from fixed
-annotations wouldn't reflect the test-time call distribution.
+There are two disjoint sets of questions from the 1000 sampled GQA val
+questions (`val_n1000_seed2025` ids, reused from quasar). Testing on the
+calibration questions would overstate coverage.
 
-Three disjoint splits of the 1000 sampled GQA val questions
-(`val_n1000_seed2025` ids, reused from quasar):
-
-| phase | split | what runs | produces |
+| phase | questions | what runs | produces |
 |---|---|---|---|
-| 0. scores | `score` (200) | point-estimate agent (top-1 values, OWL > 0.1), no sets | per-tool `D_cal,k` = true-label scores; also **the non-conformal baseline** |
-| 1. calibrate | `cal` (300) | conformal agent with per-question ACI, for each `α_1 ∈ {0.02, 0.05, 0.1, 0.2}` | chosen `α̂_1` |
-| 2. test | `test` (500) | conformal agent at `α̂_1` | reported numbers |
+| calibrate | 200 | point-estimate agent (top-1 values, OWL > 0.1), no sets | per tool k: `D_cal,k` = scores of the true labels → baseline threshold `Q̂_k(1 − α*)`. Also **the non-conformal baseline** |
+| test | 800 | conformal agent, per-question ACI from α_1 = α\* | reported numbers |
 
-Phase 1 is a one-parameter **Learn-then-Test** with fixed-sequence testing.
-The trace-level risk is `R(α_1) = P(some labeled call in the trace is
-uncovered)`. Test grid values from most to least conservative, each with a
-binomial p-value for `R ≤ δ` at level ε; stop at the first failure; `α̂_1` =
-the last one that passed. This gives `P(R(α̂_1) ≤ δ) ≥ 1 − ε`. It doesn't need
-`R` to be monotone in `α_1`, and it's valid even though `α_1` shapes the traces.
-Defaults: `δ = 0.1`, `ε = 0.1`. `--risk answer` uses "final answer set misses
-GQA answer" as the event instead.
+What α_1 = α\* gives you:
+- **First call of each question:** threshold `Q̂_k(1 − α*)`, i.e. split conformal.
+  This covers with probability ≥ 1 − α\* *if* the call is exchangeable with
+  tool k's calibration calls.
+- **Why it might not be:** the test agent sees sets, while the calibration
+  agent saw point estimates, so it makes different calls. This is the
+  endogenous shift (`paper/architecture.md` §1). ACI is the correction: when
+  the baseline under-covers, observed misses lower α_t.
+- **Formal ACI guarantee:** with `--no_reset`, one ACI stream runs across all
+  test questions, and Prop. 4.1 gives `|miscoverage − α*| ≤ (1 − α* + γ)/(γT)`
+  with T in the thousands. With per-question reset, the same quantity is
+  reported empirically.
 
-Per-trace coverage over ~5 calls is coarse (0, 0.2, …, 1). So "≥ 90%
-per-trace coverage" effectively means "all calls covered", which is why the
-event above is *any miss in the trace*.
+Baselines from the same code: `--gamma 0` (fixed split conformal, no
+adaptation), `--no_reset` (above), and the calibrate phase (point estimates).
 
-Baselines from the same code: `--gamma 0` (fixed-α split conformal),
-`--no_reset` (one ACI stream across all questions, where Prop. 4.1 is
-meaningful over T in the thousands), phase 0 (point estimates).
+Possible later addition, not built: choose α_1 by Learn-then-Test over a
+grid, which would give a formal per-trace guarantee ("P(any miss in a trace)
+≤ δ").
 
-## 5. The answer DSL
+## 4b. Selector-aware batch thresholds (`--method gcp|mvp`)
 
-The policy ends by calling `answer(spec)`. The spec is one line that combines
-**observation ids**. It never calls tools again: under ACI, α has moved since
-the observation, so a re-call would produce a different set than the one the
-agent reasoned over.
+Path A of two. The batch step sets group-aware starting thresholds; online
+adaptation against the agent's own shift (path B) comes later. ACI (§2)
+stays as `--method aci`, the default.
+
+**Selectors** (`selector.py`). A selector `φ(x, w) ∈ {1..k} ∪ {∅}` picks at
+most one tool call in a trace. It must be stable: `∅` until its call
+appears, then that index for the rest of the trace. Here every selector is
+"the n-th call satisfying `pred`", and `pred` reads only the call's own
+features and the trace before it, so stability holds by construction. A
+call's threshold is
+
+  `λ(x, w, i) = λ_fam(i) + Σ_φ 1{φ(x, w) = i} λ_φ`
+
+where the family intercept gives calls that no selector picks a threshold.
+The objective, per selector: `P(f*(z_i) ∈ C(z_i) | φ selects i) ≥ 1 − α`.
+A selector picks at most one call per question, so its calibration rows are
+one per question (iid), unlike pooling every call of a trace.
+
+Default selectors, for each family in {find, query, yesno}:
+- `fam#n`, n = 1..3: the n-th call of the family (step depth)
+- `fam|qtype#1`: the first call on a question of type
+  verify/choose/logical/compare/query. `qtype()` reads only the text, and
+  matches GQA's structural types on 99.5% of 20k val questions.
+- `fam|image#1`: the first call on the whole image
+- `fam|after_crowded#1`: the first call after a find with ≥ 10 raw OWL boxes
+  > 0.1 (loop-state drift; uses raw counts, so it doesn't depend on λ)
+- and `query|{color,material,name,other}#1`
+
+**Fitting** (`conformal.py`). Both algorithms come from Jung, Noarov,
+Ramalingam & Roth, *Batch Multivalid Conformal Prediction* (2022), and use
+the labelled calibration calls as rows `(true-label score, groups)`:
+- `fit_gcp` (Alg. 1, BatchGCP): an LP for the λ that minimises pinball loss
+  at q = 1 − α. Gives coverage q in every group with ≥ `--min_count` rows.
+  Family intercepts are always fitted; a family with no data gets the full set.
+- `fit_mvp` (Alg. 2, BatchMVP): starts from GCP, snaps to the grid k/m, then
+  repeatedly patches the (group, threshold level) cell with the worst
+  coverage until each group's quantile calibration error is ≤ `tol · P(g)`.
+  The result also holds conditional on the threshold value. It differs from
+  the paper in two ways, both for small samples: a patch takes the closest
+  shift with coverage ≥ q when one exists, and a cell that can't be improved
+  is skipped instead of stopping the algorithm.
+- A held-out share of calibration questions (`--holdout`) reports per-group
+  coverage for per-tool split / GCP / MVP before the test phase runs (no
+  agent shift in that check).
+
+**Calibration data.** `--cal_pool` draws `n_cal` more GQA val questions
+(from all 2,011,853, like the test file) on images the 1000-question test
+file doesn't use. The scene graph is only needed to grade calibration calls.
+At test time GCP/MVP thresholds are static and need no labels; only ACI
+needs them.
+
+Known limits: the calibration agent (point estimates) still differs from the
+test agent, so selector membership shifts between them. That is path B's
+job. GCP/MVP make no finite-sample correction, so small groups over-fit; the
+held-out table shows it. On 280 old calibration rows the per-selector
+held-out n was only 10–37.
+
+## 5. The trace is a program (DSL)
+
+Each loop step appends one line to a straight-line program. A line is a tool
+call or a combinator over earlier lines, and every line holds a set, its α,
+and its **running bound**. The agent sees the whole program so far as its
+context:
 
 ```
-answer("o3")                              # what color is the cup?        -> o3 = query(r1, color)
-answer("union(o3, o5)")                   # two candidate cups queried
-answer("yesno(same(o3, o5))")             # same color?
+Q: Is the cup the same color as the plate?
+
+o1 = find("cup")                 -> {r1, r2}        α=0.10   bound ≥ 0.90
+o2 = find("plate")               -> {r3}            α=0.10   bound ≥ 0.90
+o3 = query(r1, "color")          -> {white, gray}   α=0.10   bound ≥ 0.80   (needs o1)
+o4 = query(r2, "color")          -> {white}         α=0.10   bound ≥ 0.80   (needs o1)
+o5 = query(r3, "color")          -> {white}         α=0.10   bound ≥ 0.80   (needs o2)
+answer = same(union(o3, o4), o5) -> {yes, no}                bound ≥ 0.50   (needs o1..o5)
+```
+
+- **Dependencies.** A line depends on every line whose output it uses: `o3`
+  queries region `r1`, which came from `o1`, so `o3` is only meaningful if
+  `o1` also covered. A line's closure is all of its ancestors, each counted
+  once (`o1` is shared by `o3` and `o4`).
+- **Running bound.** A line misses only if some line in its closure missed,
+  so `P[line covers] ≥ 1 − Σ_{o ∈ closure} α_o` (union bound; α_o is the α_t
+  in force at that call). Every line shows this, so mid-trace the agent can
+  see what a candidate answer would be worth and decide whether to probe
+  more or commit. The final line's bound is the answer's guarantee.
+- **No re-calls.** Combinators only read sets that are already in the
+  program. Re-calling a tool after α has moved would give a different set
+  from the one the agent reasoned over.
+- The agent writes tool calls through function calling and the final line
+  through `answer(spec)`, for example:
+
+```
+answer("o3")                              # what color is the cup?
+answer("union(o3, o4)")                   # two candidate cups
+answer("same(o3, o5)")                    # same color?
 answer("choose(o3, 'red', 'blue')")       # red or blue?
 answer("and_(o2, not_(o4))")              # logical questions
 answer("side(o1, o6)")                    # left or right? (from boxes of two find sets)
@@ -141,35 +235,67 @@ answer("side(o1, o6)")                    # left or right? (from boxes of two fi
 | combinator | semantics (lifted pointwise over sets, then joined) |
 |---|---|
 | `union(a, …)` | set union |
-| `same(a, b)`, `different(a, b)` | `{yes}` / `{no}` / `{yes, no}` over all pairs |
-| `and_`, `or_`, `not_` | three-valued over `{yes, no}` sets |
-| `choose(a, x, y)` | `a ∩ {x, y}` |
-| `side(f_a, f_b)` | `{left, right}` from box centres, over all box pairs |
+| `same(a, b)`, `different(a, b)` | `{yes}` / `{no}` / `{yes, no}` over all pairs; `b` may be a literal (a constant, α = 0) |
+| `and_(a, b, …)`, `or_(a, b, …)`, `not_` | three-valued over `{yes, no}` sets; Python `and`/`or`/`not` also accepted |
+| `choose(a, x, y)` | `a ∩ {x, y}`; rejects find lines, and yes/no lines unless the options are yes/no |
+| `side(f_a, f_b)`, `above(f_a, f_b)` | `{left, right}` / `{above, below}` from box centres, over all box pairs; `f_b` may be `image` (side of the photo) |
 
-- **Soundness.** Combinators are deterministic, so if every observation in the
-  spec's **dependency closure** covers, the answer set covers. The closure
-  includes the `find` behind each region id, and each observation is counted
-  once. So `P[y* ∈ answer] ≥ 1 − Σ_{o ∈ closure} α_o` (union bound, with α_o =
-  the α_t in force at that call). This is reported alongside each answer,
-  not enforced.
+- **Soundness.** Combinators are deterministic, so the running bound above
+  is sound for the answer line too. It's reported, not enforced.
 - What it doesn't cover: a spec with the wrong logic (policy error). That's
   measured separately: "all closure observations covered but answer missed".
-- Parsed with `ast` against a whitelist (names = combinators, `o<k>` ids,
-  string literals). No `eval`.
+- Parsed with `ast` against a whitelist (names = combinators, `o<k>`/`r<k>`
+  ids, string literals). No `eval`. A bare literal answer (`answer("no")`) is
+  rejected: the answer has to be derived from lines.
+- Answer type checks (an error goes back to the agent): the answer set can't
+  be empty; yes/no questions (Is/Are/Do/Does/… with no " or ") need a set
+  inside `{yes, no}`; what/which/who/where/how questions can't get one;
+  "which side" questions need `{left, right}`.
 
 ## 6. Labels (`labels.py`, the one swap point)
 
-GQA val scene graphs (`val_sceneGraphs.json`) give objects with name, box,
-attributes and relations. `label(call, scene_graph) -> y_t | None`:
+Two graders implement the same five methods; `--grader` picks one.
+
+**`terra` (default): `TerraLabeler`.** gpt-6.1-terra (`--grader_model`,
+reasoning effort medium) answers each call itself, from the crop the tool saw,
+without seeing the tool's scores. Coverage then means "the set contains the
+grader's answer", so the grader's own error rate bounds what that coverage
+says about the truth. Replies are disk-cached.
+
+| tool | grader asks | unlabeled when |
+|---|---|---|
+| `find(name)` | the region with every proposed box drawn and numbered: which boxes each frame one whole `name` (one per object), and how many `name`s no box frames. Instances = the chosen boxes + one empty instance (score 1) per unframed object | the reply isn't the JSON asked for |
+| `query(r, attr)` | closed category: "What is the `attr` of the `name`? Answer with exactly one word from: …"; `name`: the object's name in one or two words | open attributes; a reply outside the category |
+| `verify` / `exists` | the tool's yes/no question | reply isn't yes/no |
+| `relate(a, b, rel)` | the union crop with box 1 (red) and box 2 (blue) drawn: is 1 `rel` 2? | reply isn't yes/no |
+
+**`scene_graph`: `SceneGraphLabeler`.** GQA val scene graphs (`val_sceneGraphs.json`) give objects with name, box,
+attributes and relations. GQA's question annotations give, per question, the
+object ids the question and answer refer to (`data.question_objects()`, from
+lmms-lab/GQA `val_all_instructions`). **Only the labeller uses them; the agent
+never sees them.** A strong-model labeller would supply the same thing ("which
+object does this question mean") on datasets without annotations.
+`label(call) -> y_t | None`:
 
 | tool | label | unlabeled when |
 |---|---|---|
-| `find(name)` | sg objects whose name matches the phrase's head noun (lowercase, singular, small synonym table), with any other words required among their attributes | no sg object matches the name *and* the name isn't in the GQA object vocab |
-| `query(r, attr)` | region → sg object with max IoU ≥ 0.5; truth = its attributes ∩ vocab[attr] (`name` → its name). Several true values ⇒ covered iff any is in the set; score = min over them | no IoU match, or no attribute of that category |
-| `verify(r, p)` | yes if `p` is among the object's attributes/name; no if the object has *another* value from `p`'s category | `p`'s category absent on the object (scene graphs are incomplete; absence isn't "no") |
-| `exists(name)` | yes iff a matching sg object is in the region | — |
-| `relate(a, b, rel)` | yes iff the sg has `rel` from A's object to B's | either region unmatched |
+| `find(name)` | default (`--find_label all`): **every** object in the region whose name matches the phrase's head noun (lowercase, singular, small synonym table), independent of the question. With `--find_label relevant`: only the object(s) the question means. `[]` if no object of that name is in the region (vacuously covered) | the phrase isn't in the GQA object vocab; with `relevant`, also when the noun is in the image but none of its instances is meant |
+| `query(r, attr)` | region → the sg object *with the name it was found under* that it finds (`same_object`); for `image`, any object at IoU ≥ 0.5. Truth = its attributes ∩ the category (color, material, size, height, length, shape; `name` → its name). Several true values ⇒ covered iff any is in the set; score = min over them | no matching object, or no attribute of that category |
+| `verify(r, p)` | same region matching; yes if `p` is among the object's attributes/name; no if the object has *another* value from `p`'s category | `p`'s category absent on the object (scene graphs are incomplete; absence isn't "no") |
+| `exists(name)` | yes iff any matching sg object is in the region (a plain fact; ignores which object is meant) | phrase not in the GQA object vocab |
+| `relate(a, b, rel)` | same region matching; yes iff the sg has `rel` from A's object to B's | either region unmatched |
 | final answer | GQA `answer`, matched like quasar's `eval_match` (`gt in pred`, lowercased) | — |
+
+Two `find` labels. `relevant` grades find on the object the question means.
+OWL's recall on those is 92% (top-3: 85%, top-1: 64%; 372 objects from 300
+questions). But the grade then depends on the question, so a misleading or
+adversarial question changes it, and context searches go unlabelled (a
+biased sample). `all` (default) grades find the same way as the other tools:
+on what it was asked, never on what the question wanted. Its cost: OWL,
+keeping nearly every box, catches all instances in only 81% of find calls,
+and object size barely matters (instance recall 0.68 below 0.3% of the image,
+0.88 above 10%). So reaching 90% needs the full set ("anywhere"), whatever the
+threshold.
 
 The scene graphs are noisy and incomplete, so measured miscoverage partly
 reflects label error. A strong-model labeller replaces this function later
@@ -178,18 +304,33 @@ with the same signature.
 ## 7. Files
 
 ```
-data.py        GQA val questions (lmms-lab/GQA) + images + val_sceneGraphs.json; split by phase
-backends.py    OWLv2 + gpt-4o-mini JSON-confidence call + disk cache    (copied from quasar)
-conformal.py   Q̂_k from D_cal,k; per-question ACI level; LTT selection of α_1
-tools.py       the five tools: scores -> set at Q̂_k(1-α_t); observation registry (o_k, r_i, deps)
-labels.py      scene-graph oracle (§6)
-answer_dsl.py  ast-parsed combinators over observation ids + closure budget (§5)
-agent.py       OpenAI function-calling loop; observation text = set + α_t
-run.py         phases 0/1/2, jsonl logs, summary
+src/
+  data.py        GQA val questions + images + scene graphs; calibration pool
+  backends.py    OWLv2, gpt-6-luna Decisions API (choose / predicate), free-text ask, grader chat; disk cache
+  conformal.py   Q̂_k from D_cal,k; per-question ACI level; BatchGCP / BatchMVP fits (§4b)
+  selector.py    stable selectors, question type, per-trace selection state (§4b)
+  tools.py       the five tools: groups -> scores -> set at the threshold -> program line -> label -> update
+  labels.py      graders: gpt-6.1-terra and scene graph (§6)
+  answer_dsl.py  the trace program: lines, deps, running bound; ast-parsed combinators (§5)
+  agent.py       OpenAI function-calling loop; observation text = set + α_t
+  run.py         GQA calibrate + test phases, jsonl logs, summary
+  mock.py        fake image/scene graph/scores + scripted policy for --mock (planted miss)
+  blink.py       BLINK one-step test of the batch conformal layer (one call per question)
+data/
+  clean/         tracked: gqa_val_n1000_seed2025.json (the 1000 test questions, from quasar),
+                 cal_pool_n*_seed2025.json, question_objects.json
+  raw/           sceneGraphs.zip, val_sceneGraphs.json            (gitignored)
+  images/        GQA val images <imageId>.jpg                      (gitignored)
+  cache/         model and detector call cache                     (gitignored)
+runs/            gitignored: runs/<dataset>/<policy>__<tool model>__<grader>/<timestamp>/
 ```
 
-v1's `setsem.py` (lattice, two-band find) and `demo.py` go away: membership
-is binary under a conformal threshold, and `run.py --mock` replaces the demo.
+Self-checks: `uv run python src/conformal.py` (also `answer_dsl.py`, `labels.py`,
+`selector.py`, `backends.py`, `blink.py --check`).
+
+v1's `setsem.py` (lattice, two-band find), `demo.py`, `loop.py` and `prompts.py`
+are gone: membership is binary under a conformal threshold, `run.py --mock`
+replaces the demo, and `agent.py` replaces the loop and prompts.
 
 ## 8. Run
 
@@ -197,43 +338,142 @@ is binary under a conformal threshold, and `run.py --mock` replaces the demo.
 cd conformalagentloop
 cp .env.example .env          # put OPENAI_API_KEY=... in it
 uv sync
-uv run python run.py --mock   # no key, no downloads: fake backends, checks the loop/ACI/DSL
-uv run python run.py --phase all --n_score 200 --n_cal 300 --n_test 500
+uv run python src/run.py --mock   # no key, no downloads: fake backends, checks the loop/ACI/DSL
+uv run python src/run.py --n_cal 200 --n_test 800
+uv run python src/run.py --method mvp --cal_pool --n_cal 1000 --n_test 1000
 ```
 
 The first real run downloads GQA val images from HuggingFace (~3 GB), OWLv2
-weights (~1.8 GB) and `sceneGraphs.zip` from Stanford (~40 MB), into `data/`
-(gitignored). OWLv2 uses MPS if available, else CPU.
+weights (~1.8 GB, HF cache) and `sceneGraphs.zip` from Stanford (~45 MB) into
+`data/images/` and `data/raw/`. OWLv2 uses MPS if available, else CPU. Tool and
+grader calls are cached in `data/cache/`.
 
-Flags: `--alpha 0.1 --gamma 0.05 --delta 0.1 --eps 0.1 --risk {trace,answer}
---no_reset --policy_model gpt-4o-mini --max_steps 8`.
+Flags: `--method aci|gcp|mvp --alpha 0.1 --gamma 0.05 --no_reset
+--policy_model gpt-6-luna --vlm_model gpt-6-luna --grader terra|scene_graph
+--grader_model gpt-6.1-terra --max_steps 12 --workers 8
+--cal runs/gqa/<models>/<ts> --cal_pool --find_label all|relevant --holdout 0.2
+--min_count 20 --mvp_m 20 --mvp_tol 0.002`.
+`--cal` reuses an earlier run's calibrate phase (its `calls.jsonl`) and skips
+it; pass the same `--cal_pool` as that run. GCP/MVP need a calibration
+made after selectors existed. Without `--cal_pool`, test questions are
+`[n_cal : n_cal + n_test]` of the file; with it, the file's first `n_test`.
+`--no_reset` runs sequentially.
 
-**Cost:** roughly 5–10 gpt-4o-mini calls per trace. Phase 1 runs the cal
-split once per grid value (4 × 300 traces). The whole pipeline costs a few
-dollars; VLM calls are cached across phases.
+**Cost:** roughly 5–10 policy calls (gpt-6-luna) per trace, a few Decisions API
+calls ($0.10 / M input tokens, output free) and one grader call (gpt-6.1-terra)
+per tool call. Tool and grader calls are disk-cached; policy calls are not.
 
 ## 9. Outputs
 
-`runs/<timestamp>/`:
-- `calls.jsonl`: one row per tool call with question id, t, tool, args,
-  set, α_t, threshold, label, covered, unlabeled
-- `traces.jsonl`: one row per question with spec, answer set, closure
-  budget, answer covered, all-calls covered, steps
+`runs/gqa/<policy>__<tool model>__<grader>/<timestamp>/` (mock: `runs/gqa/mock/`):
+- `calls.jsonl`: one row per tool call with question id, t, line, expr,
+  set, α_t, threshold, label, covered, true-label score, raw scores; find
+  also has `instances` ([score, covered] per instance)
+- `traces.jsonl`: one row per question with the rendered program, spec,
+  answer set, closure, bound, answer covered, any miss, thoughts, α start/end
+- `cal_scores.json`: the per-family calibration scores
+- `thresholds.json` (gcp/mvp): λ per group, MVP grid and patches
 - `summary.md`, with:
   - per tool: coverage vs 1 − α*, mean set size, % unlabeled
-  - per trace: P(any miss) vs δ
+  - per group (family, selector): coverage given the selector picked a call
+  - gcp/mvp: held-out per-group coverage of the fit (§4b)
+  - per trace: P(any miss in the trace)
   - answers: answer coverage, accuracy (singleton & correct), set size,
     policy-logic errors
   - comparison against the baselines
 
 ## 10. Open / known limits
 
-- Per-question ACI has no within-trace theorem (T too small); the guarantee
-  is the LTT one over iid questions (§4).
-- The union bound ignores correlation between calls on the same image.
-- Labels are noisy (§6); free-text tool arguments are mapped to scene-graph
-  objects heuristically.
-- No ground truth at deployment: within-trace ACI needs the labeller. In GQA
-  it is the scene graph; elsewhere it is the strong-model labeller.
+Theory gaps (deferred):
+- Per-question ACI has no within-trace theorem (T ≈ 3–12 calls, so Prop. 4.1
+  is vacuous). Formal guarantees: split conformal at the first call, Prop. 4.1
+  with `--no_reset` (§4). Coverage conditioned on each action/step is not
+  addressed; calibration is only per tool family.
+- The union bound ignores correlation between calls on the same image, and it
+  counts a find line once even when several of its regions are used.
+- The "anywhere" region makes `find`'s full set cover, but it is only added
+  when the threshold reaches 1; it isn't a scored label (see pruning below).
+
+Engineering limits:
+- **Pruning (deferred).** Even with question-relevant labels, `find`'s 90%
+  threshold keeps boxes down to OWL ≈ 0.08, nearly all proposals. Raw OWL
+  scores rank boxes well within an image but are low in absolute terms.
+  Candidates: a relative score `1 − s / s_top`, and a scored "anywhere" label
+  (OWL's top score is 0.16 median when it misses the object vs 0.44 when it
+  finds it).
+- Several boxes ⇒ the agent queries them one by one (slow; α adds up per box).
+  A lifted `query(o1, …)` over all boxes would need its own calibration.
+- The terra grader is not yet audited on its own (luna and gpt-5.4 were:
+  `runs/oracle_audit/`); it is the same vendor as the tools, so shared blind
+  spots look like coverage. Colors with no single right answer make single-word
+  grades shaky. With `scene_graph`, labels are noisy and free-text tool
+  arguments are mapped to scene-graph objects heuristically (§6).
+- Instances of one find call are graded together, so they are not independent
+  calibration rows.
+- No ground truth at deployment: within-trace ACI needs the grader.
 - Delayed feedback (`paper/architecture.md` §3.4) isn't needed for GQA, since
   feedback is immediate. Revisit for datasets where labels arrive late.
+
+## 11. Change log (v2 iterations)
+
+Each item: what went wrong on real GQA runs → what changed.
+
+1. **DSL robustness.** `and_(a, b, c)` raised a Python `TypeError` and crashed
+   the question → combinators take any number of arguments, and any bad call
+   becomes a `DslError` the agent sees and can fix. Python `not`/`and`/`or`
+   are accepted.
+2. **Literal answers.** The agent wrote `answer("no")` and looped until
+   `max_steps` → clear error ("reference a line, e.g. answer('o1')"), and
+   literals are allowed as constants in `same`/`different`
+   (`same(side(o1, o2), 'left')`).
+3. **Spatial relations.** The agent used VLM `relate` for left/right one box
+   pair at a time → `relate` rejects left/right/above/below/side; `side`/
+   `above` compute them from box geometry over all pairs, and accept `image`
+   ("which side of the photo").
+4. **Answer type checks.** `{round}` for "does it look round?", `{yes}` for
+   "which color?", `{}` from `choose` on the wrong kind of line → the answer
+   must be non-empty, yes/no questions need ⊆ {yes, no}, what/which/… can't
+   be yes/no, "which side" needs ⊆ {left, right}; `choose` rejects find lines
+   and yes/no lines.
+5. **Box matching.** Strict IoU ≥ 0.5 marked good detector boxes as misses
+   (OWL boxed pot + handle + lid; the annotator boxed only the body: IoU 0.25)
+   → `same_object`: IoU ≥ 0.3, or the box holds ≥ 80% of the object at ≤ 4×
+   its area.
+6. **Full set for `find`.** ACI needs α ≤ 0 to give a set that covers; OWL's
+   proposals alone miss ~8% of relevant objects → at threshold 1 the set adds
+   "anywhere in the searched region".
+7. **Name-aware region labels.** Queries on near-miss boxes went unlabeled →
+   `query`/`verify`/`relate` match a region only to objects with the name it
+   was found under, using `same_object`. Added size/height/length/shape
+   categories.
+8. **Relevance-based `find` labels.** "Every instance" made the threshold 1
+   regardless of α → `find` must catch the object the question means (§6).
+9. **Calibration pools.** `verify`/`exists`/`relate` pool into one `yesno`
+   family; each tool alone is called too rarely to calibrate.
+10. Smaller: region ids sort numerically; default `max_steps` 8 → 12; traces
+    log the errors the agent hit.
+11. **Selector-aware thresholds (path A).** One threshold per tool family
+    ignored step depth, question type and loop state → selectors (`selector.py`)
+    plus BatchGCP/BatchMVP fits (`--method gcp|mvp`, §4b), and a calibration
+    pool of other val questions (`--cal_pool`). ACI is unchanged.
+12. **Question-independent `find` labels.** Grading find on the question's
+    object made the grade depend on the question, and threw out context
+    searches → default `--find_label all`; `relevant` is kept.
+13. **Query prompt and scores.** "What is the height of the main object?" got
+    "double decker bus", and 21% of calibration queries never listed the true
+    value → the prompt names the found object, and closed categories are scored
+    from logprobs over the label words. Asking a VLM to "list every option"
+    doesn't work with an image (it still lists 2–4). On 32 replayed color/material
+    calls (same boxes and truths), the 90% cutoff was the full label space for
+    gpt-4o-mini, gpt-5.4-nano/mini (logprobs capped at top-5) and gpt-6-luna
+    (self-reported). gpt-4.1-mini logprobs gave a mean set of 4.75 options.
+    gpt-4.1-mini was the default until item 15.
+14. **Layout.** Code in `src/`; data split into `raw/`, `clean/` (tracked),
+    `images/`, `cache/`; runs under `runs/<dataset>/<models>/`.
+15. **gpt-6-luna tools.** Closed queries and yes/no tools score with the
+    Decisions API (`choice`: a probability for every label word; `predicate`:
+    P(yes)). On hard color crops it spread mass where gpt-4.1-mini put ~1.0 on
+    one word. Open queries use gpt-6-luna free text.
+16. **Strong-model grader, per-instance find.** gpt-6.1-terra grades every call
+    (`--grader terra`, default), so calls the scene graph couldn't map are
+    labelled too. `find` grades each instance as its own event (§3).

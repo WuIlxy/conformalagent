@@ -1,0 +1,17 @@
+[project]
+name = "conformalagentloop"
+version = "0.2.0"
+description = "ReAct agent over conformal prediction sets with per-question ACI, on GQA"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "openai>=1.61",
+    "python-dotenv>=1.0",
+    "pillow>=10.0",
+    "datasets>=3.0",
+    "torch>=2",
+    "transformers>=4.51,<5",
+    "scipy>=1.15",
+]
+
+[tool.uv]
+package = false

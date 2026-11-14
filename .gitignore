@@ -2,3 +2,10 @@
 __pycache__/
 .DS_Store
 conformalagentloop/paper/
+.env
+conformalagentloop/data/raw/
+conformalagentloop/data/images/
+conformalagentloop/data/cache/
+conformalagentloop/src/oracle_audit.py
+conformalagentloop/runs/
+.venv/
