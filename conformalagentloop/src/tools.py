@@ -4,7 +4,7 @@ scores -> set at the threshold -> program line -> scene-graph label -> update
 after every labelled call) or a conformal.Fitted (group-aware, static).
 
 `cp=None` is the point-estimate agent used in the calibrate phase: top-1
-values / OWL > 0.1 (quasar's thresholds), no alpha, but the true-label score
+values / detector score > 0.1 (quasar's thresholds), no alpha, but the true-label score
 S(y_t) and the call's groups are still logged so they can become calibration data.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from labels import COLORS, MATERIALS, category, same_object
 from selector import Selection, default_selectors, qtype
 
 POINT_FIND = 0.1          # quasar ABSTRACT_FIND_LOW
-CROWDED = 10              # a find with this many raw OWL boxes > POINT_FIND is "crowded"
+CROWDED = 10              # a find with this many raw detector boxes > POINT_FIND is "crowded"
 SPATIAL = {"left", "right", "above", "below", "top", "bottom", "side"}
 
 
@@ -105,7 +105,7 @@ class Env:
             kept = [(b, s) for b, s in cands if 1 - s <= q]
         else:
             kept = [(b, s) for b, s in cands if s > POINT_FIND]
-        # q >= 1 admits every label with S <= 1, including boxes OWL never proposed.
+        # q >= 1 admits every label with S <= 1, including boxes the detector never proposed.
         # The full label space must cover (ACI's alpha <= 0 case), so add the
         # search region itself: "somewhere in here".
         anywhere = q is not None and q >= 1

@@ -125,7 +125,8 @@ class TerraLabeler:
         """Count the objects in the region (no boxes drawn), then check proposed
         boxes one at a time, best score first, each drawn alone; stop once as many
         are confirmed as counted.  Objects no box frames come back as None.  A
-        box framing an already confirmed object is skipped (same object)."""
+        near-duplicate of a confirmed box (IoU >= 0.7) is skipped; same_object is
+        too loose here and merged two people standing close together."""
         n = _count(self._ask(self.image, region, f'How many separate objects matching "{name}" are '
                                                  f"visible in this image? Answer with a number only."))
         if n is None:
@@ -134,7 +135,7 @@ class TerraLabeler:
         for b, _ in sorted(cands or [], key=lambda c: -c[1]):
             if len(found) >= n:
                 break
-            if any(same_object(f, b) for f in found):
+            if any(iou(f, b) >= 0.7 for f in found):
                 continue
             img = draw_boxes(self.image, region, [b])
             yn = _yn(self.b.chat(self.model, [(img, (0, 0, img.width, img.height))], FRAME.format(name=name),

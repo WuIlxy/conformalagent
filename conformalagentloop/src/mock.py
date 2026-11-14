@@ -1,5 +1,5 @@
 """No-key, no-download fixtures for `run.py --mock`: a fake image + scene graph,
-fake OWL/VLM scores, and a scripted policy.  The test question has a planted
+fake detector/VLM scores, and a scripted policy.  The test question has a planted
 VLM miss so ACI must react (README §2)."""
 from __future__ import annotations
 from types import SimpleNamespace

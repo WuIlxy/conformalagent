@@ -225,7 +225,7 @@ def main():
         from labels import SceneGraphLabeler, TerraLabeler
         qs = data.questions()
         if args.cal_pool:
-            cal_qs = [] if args.cal else data.cal_pool(args.n_cal)
+            cal_qs = [] if args.cal else data.cal_pool(max(args.n_cal, 2500))[:args.n_cal]   # same questions as earlier 1000-cal runs
             test_qs = qs[:args.n_test]
         else:
             cal_qs = [] if args.cal else qs[:args.n_cal]

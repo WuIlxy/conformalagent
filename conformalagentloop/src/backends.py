@@ -1,5 +1,6 @@
 """Raw model scores, disk-cached by (image id, box, text, model).
-  detect     OWLv2 boxes + scores (from quasar's epic/imgpatch_local)
+  detect     Grounding DINO boxes + scores, no box cap (OWLv2 + a 20-box cap left
+             20% of graded objects with no box at all; DINO uncapped: 6%)
   choose     gpt-6-luna Decisions API: P(option) for every option of a closed label set
   predicate  gpt-6-luna Decisions API: P(yes)
   ask        free-text answers with self-reported scores, for open queries
@@ -19,8 +20,8 @@ from typing import List, Tuple
 from answer_dsl import Box, norm
 from labels import iou
 
-DETECT_FLOOR = 0.05      # OWL candidates below this never enter any set
-MAX_BOXES = 20
+DETECT_FLOOR = 0.05      # detector candidates below this never enter any set
+DETECTOR = "IDEA-Research/grounding-dino-base"
 DECIDE_MODEL = "gpt-6-luna"   # the only model the Decisions API serves
 
 ASK_PROMPT = """You are given an image and a question.
@@ -71,31 +72,36 @@ class Backends:
         self.cache = Cache(cache_dir)
         self.tokens = [0, 0]                  # tool [input, output] tokens, uncached calls this process
         self.chat_tokens = {}                 # model -> [input, output] for chat() (the grader)
-        self._owl = None
-        self._owl_lock = threading.Lock()     # ponytail: one global lock on OWL; fine at ~1 call/s
+        self._det = None
+        self._det_lock = threading.Lock()     # ponytail: one global lock on the detector; fine at ~1 call/s
 
     def _detector(self):
-        if self._owl is None:
+        if self._det is None:
             os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             import torch
-            from transformers import pipeline
+            from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
             device = "mps" if torch.backends.mps.is_available() else "cpu"
-            self._owl = pipeline(model="google/owlv2-base-patch16-ensemble",
-                                 task="zero-shot-object-detection", device=device)
-        return self._owl
+            self._det = (AutoProcessor.from_pretrained(DETECTOR), device,
+                         AutoModelForZeroShotObjectDetection.from_pretrained(DETECTOR).to(device))
+        return self._det
 
     def detect(self, image_id: str, image, box: Box, name: str) -> List[Tuple[Box, float]]:
-        """Candidate boxes (image coords) with OWL scores, NMS'd, best first."""
+        """Candidate boxes (image coords) with detector scores, NMS'd, best first."""
         def run():
-            with self._owl_lock:
-                preds = self._detector()(image.crop(tuple(round(v) for v in box)), candidate_labels=[name],
-                                         threshold=DETECT_FLOOR)
+            import torch
+            crop = image.crop(tuple(round(v) for v in box)).convert("RGB")
+            with self._det_lock:
+                proc, device, model = self._detector()
+                inp = proc(images=crop, text=name.lower().strip() + ".", return_tensors="pt").to(device)
+                with torch.no_grad():
+                    r = proc.post_process_grounded_object_detection(
+                        model(**inp), inp.input_ids, threshold=DETECT_FLOOR, text_threshold=DETECT_FLOOR,
+                        target_sizes=[crop.size[::-1]])[0]
             x0, y0 = box[0], box[1]
-            cands = [((p["box"]["xmin"] + x0, p["box"]["ymin"] + y0,
-                       p["box"]["xmax"] + x0, p["box"]["ymax"] + y0), float(p["score"]))
-                     for p in preds]
-            return _nms(cands)[:MAX_BOXES]
-        out = self.cache.get_or(["detect", image_id, [round(v) for v in box], name], run)
+            cands = [((float(b[0]) + x0, float(b[1]) + y0, float(b[2]) + x0, float(b[3]) + y0), float(s))
+                     for b, s in zip(r["boxes"].cpu(), r["scores"].cpu())]
+            return _nms(cands)
+        out = self.cache.get_or(["detect", DETECTOR, image_id, [round(v) for v in box], name], run)
         return [(tuple(b), s) for b, s in out]
 
     @staticmethod

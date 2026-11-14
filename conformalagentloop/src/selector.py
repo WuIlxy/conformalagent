@@ -53,7 +53,7 @@ def default_selectors() -> List[Selector]:
         S += [_sel(f"{fam}|{qt}#1", lambda f, fam=fam, qt=qt: f["fam"] == fam and f["qtype"] == qt)
               for qt in QTYPES]
         S.append(_sel(f"{fam}|image#1", lambda f, fam=fam: f["fam"] == fam and f["region"] == "image"))
-        # loop-state drift: the first call after a crowded find (raw OWL count, so it
+        # loop-state drift: the first call after a crowded find (raw detector count, so it
         # doesn't depend on the thresholds themselves)
         S.append(_sel(f"{fam}|after_crowded#1", lambda f, fam=fam: f["fam"] == fam and f["crowded"]))
     for cat in ("color", "material", "name", "other"):

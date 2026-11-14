@@ -71,7 +71,7 @@ from it.
 
 | tool | set over | score `S(y)` | backend (copied from) |
 |---|---|---|---|
-| `find(name, region="image")` | boxes → new region ids `r_i` | `1 − owl_score(box)` | OWLv2 (`imgpatch_local`, `imgpatch_conformal.find`) |
+| `find(name, region="image")` | boxes → new region ids `r_i` | `1 − det_score(box)` | Grounding DINO base, every box above 0.05 after NMS (no cap) |
 | `query(region, attribute)` | values, `attribute ∈ {color, material, name, …}` | `1 − p(y)`. Closed categories (color, material, size, …): gpt-6-luna's Decisions API `choice` question gives `p` for every label word (`Backends.choose`; reported to 0.01, so words under 0.005 tie at S = 1). Open ones (name, free questions): JSON answers + self-reported scores, 0 if not listed → S = 1 | closed: Decisions API (gpt-6-luna); open: `--vlm_model` (gpt-6-luna) |
 | `verify(region, property)` | `{yes, no}` | `S(yes) = 1 − p_yes`, `S(no) = p_yes`; `p_yes` from a Decisions API `predicate` question (`Backends.predicate`) | Decisions API (gpt-6-luna) |
 | `exists(name, region="image")` | `{yes, no}` | as `verify` | same |
@@ -79,7 +79,7 @@ from it.
 
 - **`find` grades each instance on its own.** For every instance the grader
   says the call should catch, the true-label score is `1 − best matching
-  owl_score` (1 if no proposed box finds it), and that instance is covered iff a
+  det_score` (1 if no proposed box finds it), and that instance is covered iff a
   box in the set finds it. Each instance is one calibration row and one ACI
   update; the call counts as covered (for the trace's closure) iff all its
   instances are. Requiring *all* instances in one event pushed the 90% cutoff
@@ -88,9 +88,13 @@ from it.
   proposals). "Found" (`labels.same_object`): IoU ≥ 0.3, or the box holds ≥ 80%
   of the object while being at most 4× its area.
 - **`find`'s full set.** When the threshold reaches 1, the set also gets the
-  searched region itself, shown as "anywhere in the searched region". OWL's
-  proposals alone aren't the full label space (they miss ~14% of instances),
-  and ACI needs the full set to cover. `side`/`above` treat that region as
+  searched region itself, shown as "anywhere in the searched region". The
+  proposals alone aren't the full label space, and ACI needs the full set to
+  cover.
+- **Why Grounding DINO, uncapped.** On 150 random terra-graded calibration find
+  calls, the share of counted objects no proposed box finds was OWLv2 (20-box
+  cap) 20%, DINO capped 14%, DINO uncapped 6%. Above 10%, the 90% cutoff is 1
+  (keep every box); uncapped DINO's is 0.91, keeping ~7 of ~15 boxes. `side`/`above` treat that region as
   "either side".
 - `relate` rejects left/right/above/below: those come from box geometry via
   `side`/`above` in the answer spec, over all box pairs at once.
@@ -108,7 +112,7 @@ calibration questions would overstate coverage.
 
 | phase | questions | what runs | produces |
 |---|---|---|---|
-| calibrate | 200 | point-estimate agent (top-1 values, OWL > 0.1), no sets | per tool k: `D_cal,k` = scores of the true labels → baseline threshold `Q̂_k(1 − α*)`. Also **the non-conformal baseline** |
+| calibrate | 200 | point-estimate agent (top-1 values, detector score > 0.1), no sets | per tool k: `D_cal,k` = scores of the true labels → baseline threshold `Q̂_k(1 − α*)`. Also **the non-conformal baseline** |
 | test | 800 | conformal agent, per-question ACI from α_1 = α\* | reported numbers |
 
 What α_1 = α\* gives you:
@@ -157,7 +161,7 @@ Default selectors, for each family in {find, query, yesno}:
   verify/choose/logical/compare/query. `qtype()` reads only the text, and
   matches GQA's structural types on 99.5% of 20k val questions.
 - `fam|image#1`: the first call on the whole image
-- `fam|after_crowded#1`: the first call after a find with ≥ 10 raw OWL boxes
+- `fam|after_crowded#1`: the first call after a find with ≥ 10 raw detector boxes
   > 0.1 (loop-state drift; uses raw counts, so it doesn't depend on λ)
 - and `query|{color,material,name,other}#1`
 
@@ -264,7 +268,7 @@ says about the truth. Replies are disk-cached.
 
 | tool | grader asks | unlabeled when |
 |---|---|---|
-| `find(name)` | first, how many `name`s are in the region (clean crop, no boxes). Then the proposed boxes one at a time, best OWL score first, each drawn **alone** on the region: "does the red box frame one `name`?"; a box framing an already confirmed object is skipped, and checking stops once as many are confirmed as counted. Instances = the confirmed boxes + one empty instance (score 1) per counted object no box framed | the count or a box answer isn't a number / yes / no |
+| `find(name)` | first, how many `name`s are in the region (clean crop, no boxes). Then the proposed boxes one at a time, best detector score first, each drawn **alone** on the region: "does the red box frame one `name`?"; a box framing an already confirmed object is skipped, and checking stops once as many are confirmed as counted. Instances = the confirmed boxes + one empty instance (score 1) per counted object no box framed | the count or a box answer isn't a number / yes / no |
 | `query(r, attr)` | closed category: "What is the `attr` of the `name`? Answer with exactly one word from: …". `name`: every name a person might use for the object, specific to general ("baseball player, player, person"); a set covers if any of its names matches any of these either way round ("laptop" ↔ "laptop computer") | open attributes; a reply outside the category |
 | `verify` / `exists` | the tool's yes/no question | reply isn't yes/no |
 | `relate(a, b, rel)` | the union crop with box 1 (red) and box 2 (blue) drawn: is 1 `rel` 2? | reply isn't yes/no |
@@ -306,7 +310,7 @@ with the same signature.
 ```
 src/
   data.py        GQA val questions + images + scene graphs; calibration pool
-  backends.py    OWLv2, gpt-6-luna Decisions API (choose / predicate), free-text ask, grader chat; disk cache
+  backends.py    Grounding DINO, gpt-6-luna Decisions API (choose / predicate), free-text ask, grader chat; disk cache
   conformal.py   Q̂_k from D_cal,k; per-question ACI level; BatchGCP / BatchMVP fits (§4b)
   selector.py    stable selectors, question type, per-trace selection state (§4b)
   tools.py       the five tools: groups -> scores -> set at the threshold -> program line -> label -> update
@@ -343,9 +347,9 @@ uv run python src/run.py --n_cal 200 --n_test 800
 uv run python src/run.py --method mvp --cal_pool --n_cal 1000 --n_test 1000
 ```
 
-The first real run downloads GQA val images from HuggingFace (~3 GB), OWLv2
-weights (~1.8 GB, HF cache) and `sceneGraphs.zip` from Stanford (~45 MB) into
-`data/images/` and `data/raw/`. OWLv2 uses MPS if available, else CPU. Tool and
+The first real run downloads GQA val images from HuggingFace (~3 GB), Grounding DINO
+weights (~0.9 GB, HF cache) and `sceneGraphs.zip` from Stanford (~45 MB) into
+`data/images/` and `data/raw/`. The detector uses MPS if available, else CPU. Tool and
 grader calls are cached in `data/cache/`.
 
 Flags: `--method aci|gcp|mvp --alpha 0.1 --gamma 0.05 --no_reset
