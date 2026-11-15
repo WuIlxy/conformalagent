@@ -79,11 +79,19 @@ def _inside(obj: Box, region: Box) -> bool:
 
 
 GRADER = "gpt-6.1-terra"
-GRADER_EFFORT = "medium"      # ponytail: one fixed effort; tune if the grader audit says so
+GRADER_EFFORT = "medium"
 YN = " Answer with exactly one word: yes or no."
-FRAME = ('Does the red box frame one {name}? Answer yes if it mainly frames a single "{name}" (hidden '
-         'or cut-off parts are fine), no if it frames something else, only a small part of one, '
-         'or several together.' + YN)
+# Lenient on naming and box fit (audit: a red dish rejected as "not a bowl", a
+# whole-image box on a tablecloth rejected as "not the table").  The count stays strict:
+# a lenient count added ~14% more instances, mostly with no detector box.
+FRAME = ('Does the red box frame one {name}? Answer yes if it mainly frames a single object a person could '
+         'reasonably call "{name}" (a close synonym or broader/narrower term counts; the box may be loose, '
+         'include surroundings, or cut off hidden parts). Answer no only if it frames a different kind of '
+         'object, only a small part of one, or several together.' + YN)
+COUNT = ('How many separate objects that are clearly a "{name}" are visible in this image? Count only '
+         'obvious, visible instances; do not count look-alikes or broader categories. Answer with a number only.')
+OPEN = ('What is the {attribute} of the {obj} in this image? List the short answers a person might give, '
+        'most likely first, comma-separated, at most four, nothing else.')
 NAMES = ("What is the main object in this image? List the names a person might use for it, from most "
          'specific to most general (e.g. "baseball player, player, person"), comma-separated, at most '
          "six, nothing else.")
@@ -127,8 +135,7 @@ class TerraLabeler:
         are confirmed as counted.  Objects no box frames come back as None.  A
         near-duplicate of a confirmed box (IoU >= 0.7) is skipped; same_object is
         too loose here and merged two people standing close together."""
-        n = _count(self._ask(self.image, region, f'How many separate objects matching "{name}" are '
-                                                 f"visible in this image? Answer with a number only."))
+        n = _count(self._ask(self.image, region, COUNT.format(name=name)))
         if n is None:
             return None
         found = []
@@ -152,9 +159,11 @@ class TerraLabeler:
 
     def query(self, box: Box, attribute: str, name: Optional[str] = None) -> Optional[Set[str]]:
         cat = category(attribute)
-        if cat is None:
-            return None
         obj = name if name and name != "image" else "main object"
+        if cat is None:
+            # open attribute (shape words outside SHAPES, activity, pose...): every acceptable answer
+            ans = {norm(x) for x in self._ask(self.image, box, OPEN.format(attribute=attribute, obj=obj)).split(",")}
+            return (ans - {""}) or None
         if cat == "name":
             # every name a person might use: "person" and "baseball player" are both right
             names = {norm(x) for x in self._ask(self.image, box, NAMES).split(",")} - {""}
@@ -329,8 +338,8 @@ if __name__ == "__main__":
             if "red box" in text:
                 assert crops[0][0].size[0] >= 512                    # the drawn crop is upscaled
                 return "Yes." if key[-1] == [20, 20, 60, 60] else "no"
-            return {"color": "Wooden", "names": "Baseball player, player, Person", "Box 1": "no"}.get(
-                next(k for k in ("color", "names", "Box 1", "") if k in text), "Yes.")
+            return {"color": "Wooden", "activity": "Sitting, resting", "names": "Baseball player, player, Person", "Box 1": "no"}.get(
+                next(k for k in ("color", "activity", "names", "Box 1", "") if k in text), "Yes.")
     from PIL import Image
     fb = FakeBackends()
     T = TerraLabeler("img", Image.new("RGB", (200, 200)), fb)
@@ -339,6 +348,7 @@ if __name__ == "__main__":
     assert T.find("cup", whole, cands) == [(20, 20, 60, 60), None]
     assert [k[-1] for k in fb.calls[1:]] == [[0, 0, 10, 10], [20, 20, 60, 60]]
     assert T.query((20, 20, 60, 60), "color") is None                  # "wood" is not a color
+    assert T.query((20, 20, 60, 60), "activity") == {"sitting", "resting"}   # open attribute
     assert T.query((20, 20, 60, 60), "name") == {"baseball player", "player", "person"}
     assert T.exists("cup", whole) == YES and T.relate(whole, whole, "on") == NO
     assert _count("about 3 cups") == 3 and _count("none") is None

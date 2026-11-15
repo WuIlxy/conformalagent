@@ -73,7 +73,7 @@ class Backends:
         self.tokens = [0, 0]                  # tool [input, output] tokens, uncached calls this process
         self.chat_tokens = {}                 # model -> [input, output] for chat() (the grader)
         self._det = None
-        self._det_lock = threading.Lock()     # ponytail: one global lock on the detector; fine at ~1 call/s
+        self._det_lock = threading.Lock()
 
     def _detector(self):
         if self._det is None:

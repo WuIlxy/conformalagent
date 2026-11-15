@@ -82,7 +82,6 @@ def openai_policy(model: str) -> Policy:
     from openai import OpenAI
     client = OpenAI()
     # gpt-6-luna rejects function tools on chat.completions unless reasoning is off.
-    # ponytail: reasoning off; port to the Responses API if the policy needs it
     extra = {"temperature": 0} if model.startswith("gpt-4") else {"reasoning_effort": "none"}
     tokens = policy_tokens.setdefault(model, [0, 0])
 

@@ -151,8 +151,8 @@ class Env:
         truths = self.labeler.query(box, attribute, self._name(region))
         covered = true_score = None
         if truths is not None:
-            # names match either way round: "laptop" names a "laptop computer"
-            hit = (lambda t, a: match(t, a) or match(a, t)) if cat == "name" else match
+            # names and open answers match either way round: "laptop" names a "laptop computer"
+            hit = (lambda t, a: match(t, a) or match(a, t)) if cat == "name" or cat is None else match
             covered = WILD in values or any(hit(t, v) for t in truths for v in values)
             true_score = min(1 - max((p for a, p in answers if hit(t, a)), default=0.0)
                              for t in truths)
